@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Unity WebGL Player | ULTRAKILL</title>
+    <title>ULTRAKILL</title>
     <style>
         html,
         body {
@@ -52,7 +52,24 @@
         #loading-status {
             font-size: 16px;
             color: #ccc;
+            margin-bottom: 15px;
+        }
+
+        #progress-bar-container {
+            width: 300px;
+            height: 12px;
+            background: #222;
+            border: 1px solid #ff3333;
+            border-radius: 4px;
+            overflow: hidden;
             margin-bottom: 20px;
+        }
+
+        #progress-bar-fill {
+            width: 0%;
+            height: 100%;
+            background: #ff3333;
+            transition: width 0.1s ease;
         }
 
         #error-box {
@@ -76,35 +93,67 @@
 <body>
     <div id="loading-overlay">
         <div id="loading-title">ULTRAKILL LOADING...</div>
-        <div id="loading-status">Initializing downloader...</div>
+        <div id="loading-status">Initializing...</div>
+        <div id="progress-bar-container">
+            <div id="progress-bar-fill"></div>
+        </div>
         <div id="error-box"></div>
     </div>
 
     <canvas id="unity-canvas" tabindex="-1" hidden></canvas>
     <script src="Build/ultrakill.loader.js"></script>
     <script>
+        // Global Unity state reference expected by web wrappers
+        window.unityInstance = null;
+        window.unityProgress = 0;
+
         const statusEl = document.getElementById('loading-status');
         const errorBox = document.getElementById('error-box');
+        const progressFill = document.getElementById('progress-bar-fill');
+
+        /**
+         * Global Progress Dispatcher
+         * Broadcasts progress (0.0 to 1.0) through all common Unity WebGL API channels
+         */
+        function updateProgress(value, message) {
+            const clamped = Math.min(Math.max(value, 0), 1);
+            window.unityProgress = clamped;
+
+            // 1. Update On-Screen Overlay UI
+            progressFill.style.width = (clamped * 100).toFixed(1) + '%';
+            if (message) {
+                statusEl.textContent = `${message} (${Math.round(clamped * 100)}%)`;
+            }
+
+            // 2. Standard Legacy Unity WebGL callback (window.UnityProgress / parent.UnityProgress)
+            if (typeof window.UnityProgress === 'function') {
+                window.UnityProgress(clamped);
+            }
+            if (window.parent && window.parent !== window && typeof window.parent.UnityProgress === 'function') {
+                window.parent.UnityProgress(clamped);
+            }
+
+            // 3. Custom Event Dispatching (for iframe / parent site event listeners)
+            const progressEvent = new CustomEvent('UnityProgress', {
+                detail: { progress: clamped, message: message || '' }
+            });
+            window.dispatchEvent(progressEvent);
+            if (window.parent && window.parent !== window) {
+                window.parent.dispatchEvent(progressEvent);
+            }
+        }
 
         function showError(msg) {
             errorBox.style.display = 'block';
             errorBox.textContent += (errorBox.textContent ? '\n\n' : '') + '[ERROR] ' + msg;
-            statusEl.textContent = 'LOAD FAILED - SEE DETAILS BELOW';
+            statusEl.textContent = 'LOAD FAILED';
             statusEl.style.color = '#ff3333';
         }
 
-        function logStatus(msg) {
-            if (errorBox.style.display !== 'block') {
-                statusEl.textContent = msg;
-            }
-        }
-
-        // Global JavaScript Error Capture
         window.addEventListener('error', function (e) {
             showError(`${e.message} (${e.filename}:${e.lineno})`);
         });
 
-        // Global Async/Promise Error Capture
         window.addEventListener('unhandledrejection', function (e) {
             showError(`Unhandled Promise Error: ${e.reason}`);
         });
@@ -130,23 +179,32 @@
             window.addEventListener('resize', resizeCanvas);
         }
 
+        // Split total downloading progress into 0% -> 60%, leaving 60% -> 100% for Unity WASM initialization
+        let totalParts = 6; 
+        let downloadedParts = 0;
+
         async function mergeFiles(fileParts, label) {
             let buffers = [];
             for (let i = 0; i < fileParts.length; i++) {
                 const part = fileParts[i];
-                logStatus(`Downloading ${label} (${i + 1}/${fileParts.length}): ${part}...`);
-                try {
-                    let response = await fetch(part);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status} ${response.statusText} at path: "${part}"`);
-                    }
-                    let data = await response.arrayBuffer();
-                    buffers.push(data);
-                } catch (err) {
-                    throw new Error(`Failed fetching part "${part}": ${err.message}`);
+                updateProgress(
+                    (downloadedParts / totalParts) * 0.6,
+                    `Fetching ${label} (${i + 1}/${fileParts.length})`
+                );
+                
+                let response = await fetch(part);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} downloading "${part}"`);
                 }
+                let data = await response.arrayBuffer();
+                buffers.push(data);
+                
+                downloadedParts++;
+                updateProgress(
+                    (downloadedParts / totalParts) * 0.6,
+                    `Downloaded ${label} part ${i + 1}`
+                );
             }
-            logStatus(`Merging ${label} files in browser memory...`);
             let mergedBlob = new Blob(buffers);
             return URL.createObjectURL(mergedBlob);
         }
@@ -161,24 +219,38 @@
 
         async function initGame() {
             try {
+                updateProgress(0.01, "Starting download...");
+
                 const [dataUrl, wasmUrl] = await Promise.all([
-                    mergeFiles(getParts("Build/ultrakill.data.unityweb", 1, 4), "Game Assets"),
-                    mergeFiles(getParts("Build/ultrakill.wasm.unityweb", 1, 2), "Engine Code")
+                    mergeFiles(getParts("Build/ultrakill.data.unityweb", 1, 4), "Assets"),
+                    mergeFiles(getParts("Build/ultrakill.wasm.unityweb", 1, 2), "Engine")
                 ]);
 
-                logStatus("Compiling WebAssembly & starting Unity engine...");
+                updateProgress(0.60, "Preparing WebGL Instance...");
                 document.querySelector("#unity-canvas").hidden = false;
 
-                await createUnityInstance(document.querySelector("#unity-canvas"), {
-                    dataUrl: dataUrl,
-                    frameworkUrl: "Build/ultrakill.framework.js.unityweb",
-                    codeUrl: wasmUrl,
-                    streamingAssetsUrl: "StreamingAssets",
-                    companyName: "Hakita and Cake Logic",
-                    productName: "ULTRAKILL",
-                    productVersion: "1.4",
-                });
+                // Unity's native createUnityInstance with progress callback attached
+                const instance = await createUnityInstance(
+                    document.querySelector("#unity-canvas"), 
+                    {
+                        dataUrl: dataUrl,
+                        frameworkUrl: "Build/ultrakill.framework.js.unityweb",
+                        codeUrl: wasmUrl,
+                        streamingAssetsUrl: "StreamingAssets",
+                        companyName: "Hakita and Cake Logic",
+                        productName: "ULTRAKILL",
+                        productVersion: "1.4",
+                    },
+                    (unityProgress) => {
+                        // Map Unity's internal 0.0 -> 1.0 engine progress to the 0.60 -> 1.00 range
+                        const combinedProgress = 0.60 + (unityProgress * 0.40);
+                        updateProgress(combinedProgress, "Starting engine...");
+                    }
+                );
 
+                window.unityInstance = instance;
+                updateProgress(1.0, "Ready");
+                
                 document.getElementById("loading-overlay").remove();
             } catch (err) {
                 showError(err.message || err);
