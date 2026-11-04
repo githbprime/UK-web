@@ -13,23 +13,102 @@
             overflow: hidden;
             height: 100%;
             width: 100%;
+            background-color: #000;
+            color: #fff;
+            font-family: monospace;
         }
 
-        #unity-container {
+        #unity-canvas {
             width: 100%;
             height: 100%;
             position: fixed;
             top: 0;
             left: 0;
         }
+
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 99;
+            background: #0b0b0b;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        #loading-title {
+            font-size: 32px;
+            font-weight: bold;
+            color: #ff3333;
+            margin-bottom: 12px;
+        }
+
+        #loading-status {
+            font-size: 16px;
+            color: #ccc;
+            margin-bottom: 20px;
+        }
+
+        #error-box {
+            display: none;
+            max-width: 750px;
+            width: 90%;
+            background: #2a0000;
+            border: 2px solid #ff3333;
+            color: #ff9999;
+            padding: 15px;
+            border-radius: 6px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            text-align: left;
+            font-size: 14px;
+            line-height: 1.4;
+        }
     </style>
 </head>
 
-<body style="text-align: center; padding: 0; border: 0; margin: 0;">
-    <div id='loading-text' style="color: black; font-family: cursive; font-size: 48px; text-align: center; margin-top: 20px;">LOADING...</div>
+<body>
+    <div id="loading-overlay">
+        <div id="loading-title">ULTRAKILL LOADING...</div>
+        <div id="loading-status">Initializing downloader...</div>
+        <div id="error-box"></div>
+    </div>
+
     <canvas id="unity-canvas" tabindex="-1" hidden></canvas>
     <script src="Build/ultrakill.loader.js"></script>
     <script>
+        const statusEl = document.getElementById('loading-status');
+        const errorBox = document.getElementById('error-box');
+
+        function showError(msg) {
+            errorBox.style.display = 'block';
+            errorBox.textContent += (errorBox.textContent ? '\n\n' : '') + '[ERROR] ' + msg;
+            statusEl.textContent = 'LOAD FAILED - SEE DETAILS BELOW';
+            statusEl.style.color = '#ff3333';
+        }
+
+        function logStatus(msg) {
+            if (errorBox.style.display !== 'block') {
+                statusEl.textContent = msg;
+            }
+        }
+
+        // Global JavaScript Error Capture
+        window.addEventListener('error', function (e) {
+            showError(`${e.message} (${e.filename}:${e.lineno})`);
+        });
+
+        // Global Async/Promise Error Capture
+        window.addEventListener('unhandledrejection', function (e) {
+            showError(`Unhandled Promise Error: ${e.reason}`);
+        });
+
         var canvas = document.querySelector("#unity-canvas");
         if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
             var meta = document.createElement('meta');
@@ -51,16 +130,23 @@
             window.addEventListener('resize', resizeCanvas);
         }
 
-        async function mergeFiles(fileParts) {
+        async function mergeFiles(fileParts, label) {
             let buffers = [];
-            for (let part of fileParts) {
-                let response = await fetch(part);
-                if (!response.ok) {
-                    throw new Error(`Failed to download ${part} (${response.status} ${response.statusText})`);
+            for (let i = 0; i < fileParts.length; i++) {
+                const part = fileParts[i];
+                logStatus(`Downloading ${label} (${i + 1}/${fileParts.length}): ${part}...`);
+                try {
+                    let response = await fetch(part);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status} ${response.statusText} at path: "${part}"`);
+                    }
+                    let data = await response.arrayBuffer();
+                    buffers.push(data);
+                } catch (err) {
+                    throw new Error(`Failed fetching part "${part}": ${err.message}`);
                 }
-                let data = await response.arrayBuffer();
-                buffers.push(data);
             }
+            logStatus(`Merging ${label} files in browser memory...`);
             let mergedBlob = new Blob(buffers);
             return URL.createObjectURL(mergedBlob);
         }
@@ -73,26 +159,33 @@
             return parts;
         }
 
-        Promise.all([
-            mergeFiles(getParts("Build/ultrakill.data.unityweb", 1, 4)),
-            mergeFiles(getParts("Build/ultrakill.wasm.unityweb", 1, 2))
-        ]).then(([dataUrl, wasmurl]) => {
-            document.querySelector("#unity-canvas").hidden = false;
-            return createUnityInstance(document.querySelector("#unity-canvas"), {
-                dataUrl: dataUrl,
-                frameworkUrl: "Build/ultrakill.framework.js.unityweb",
-                codeUrl: wasmurl,
-                streamingAssetsUrl: "StreamingAssets",
-                companyName: "Hakita and Cake Logic",
-                productName: "ULTRAKILL",
-                productVersion: "1.4",
-            });
-        }).then(() => {
-            document.querySelector("#loading-text").remove();
-        }).catch((err) => {
-            console.error("Game load failed:", err);
-            document.querySelector("#loading-text").innerText = "FAILED TO LOAD (Check F12 Console)";
-        });
+        async function initGame() {
+            try {
+                const [dataUrl, wasmUrl] = await Promise.all([
+                    mergeFiles(getParts("Build/ultrakill.data.unityweb", 1, 4), "Game Assets"),
+                    mergeFiles(getParts("Build/ultrakill.wasm.unityweb", 1, 2), "Engine Code")
+                ]);
+
+                logStatus("Compiling WebAssembly & starting Unity engine...");
+                document.querySelector("#unity-canvas").hidden = false;
+
+                await createUnityInstance(document.querySelector("#unity-canvas"), {
+                    dataUrl: dataUrl,
+                    frameworkUrl: "Build/ultrakill.framework.js.unityweb",
+                    codeUrl: wasmUrl,
+                    streamingAssetsUrl: "StreamingAssets",
+                    companyName: "Hakita and Cake Logic",
+                    productName: "ULTRAKILL",
+                    productVersion: "1.4",
+                });
+
+                document.getElementById("loading-overlay").remove();
+            } catch (err) {
+                showError(err.message || err);
+            }
+        }
+
+        initGame();
     </script>
 </body>
 
